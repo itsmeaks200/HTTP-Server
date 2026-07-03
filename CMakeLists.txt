@@ -13,6 +13,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_executable(http_server
     src/main.cpp
+    src/http/MimeTypes.cpp
     src/http/RequestParser.cpp
     src/http/Response.cpp
     src/http/Router.cpp

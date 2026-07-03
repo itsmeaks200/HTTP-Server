@@ -7,6 +7,8 @@
 #include <sstream>
 #include <utility>
 
+#include "http/MimeTypes.hpp"
+
 namespace http {
 namespace {
 
@@ -16,7 +18,7 @@ Response MakeError(int status_code, std::string reason_phrase) {
     r.body = reason_phrase + "\n";
     r.content_length = r.body.size();
     r.reason_phrase = std::move(reason_phrase);
-    r.SetHeader("Content-Type", "text/plain");
+    r.SetHeader("Content-Type", "text/plain; charset=utf-8");
     return r;
 }
 
@@ -56,7 +58,7 @@ Response StaticFileRouter::Handle(const Request& request) const {
     Response r;
     r.status_code = 200;
     r.reason_phrase = "OK";
-    r.SetHeader("Content-Type", "text/plain");  // real MIME detection is Milestone 5
+    r.SetHeader("Content-Type", LookupMimeType(full_path));
     r.content_length = static_cast<std::size_t>(st.st_size);
 
     // HEAD must report the same Content-Length as GET would, but must not

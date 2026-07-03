@@ -9,6 +9,10 @@ std::string Response::SerializeHeader() const {
     out << "HTTP/1.1 " << status_code << ' ' << reason_phrase << "\r\n";
     out << "Content-Length: " << content_length << "\r\n";
     out << "Connection: close\r\n";  // real Keep-Alive handling is Milestone 7
+    // We assert Content-Type ourselves via extension-based lookup; nosniff
+    // tells the browser to trust it instead of re-guessing from file bytes,
+    // which is the mechanism behind a whole class of MIME-sniffing XSS bugs.
+    out << "X-Content-Type-Options: nosniff\r\n";
     for (const auto& [name, value] : headers) {
         out << name << ": " << value << "\r\n";
     }
