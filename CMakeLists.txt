@@ -11,5 +11,9 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
-add_executable(http_server src/main.cpp)
+add_executable(http_server
+    src/main.cpp
+    src/http/RequestParser.cpp
+    src/util/StringUtils.cpp
+)
 target_include_directories(http_server PRIVATE include)

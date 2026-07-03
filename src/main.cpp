@@ -7,7 +7,18 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "http/RequestParser.hpp"
+
 namespace {
+
+void SendBadRequest(int client_fd) {
+    const char* bad_request =
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    send(client_fd, bad_request, std::strlen(bad_request), 0);
+}
 
 // Real-world servers cap this (nginx defaults to 8K) so a client that never
 // sends a terminating blank line can't grow this buffer without bound.
@@ -97,18 +108,26 @@ int main() {
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         std::printf("Connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
 
-        auto request = ReadRequestHeaders(client_fd);
-        if (!request) {
-            const char* bad_request =
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Length: 0\r\n"
-                "Connection: close\r\n"
-                "\r\n";
-            send(client_fd, bad_request, std::strlen(bad_request), 0);
+        auto raw_request = ReadRequestHeaders(client_fd);
+        if (!raw_request) {
+            SendBadRequest(client_fd);
             close(client_fd);
             continue;
         }
-        std::printf("Received request (%zu bytes):\n%s\n", request->size(), request->c_str());
+
+        auto request = http::ParseRequest(*raw_request);
+        if (!request) {
+            SendBadRequest(client_fd);
+            close(client_fd);
+            continue;
+        }
+
+        std::printf("%s %s%s%s HTTP/%d.%d\n", request->method_raw.c_str(), request->path.c_str(),
+                     request->query.empty() ? "" : "?", request->query.c_str(),
+                     request->version_major, request->version_minor);
+        for (const auto& [name, value] : request->headers) {
+            std::printf("  %s: %s\n", name.c_str(), value.c_str());
+        }
 
         const char* response =
             "HTTP/1.1 200 OK\r\n"
