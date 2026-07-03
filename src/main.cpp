@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -8,8 +10,27 @@
 #include <unistd.h>
 
 #include "http/RequestParser.hpp"
+#include "http/Router.hpp"
 
 namespace {
+
+// Loops send() to handle partial writes, which POSIX explicitly permits
+// (send() may transfer fewer bytes than requested even on success).
+bool SendAll(int fd, const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, data + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("send");
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
 
 void SendBadRequest(int client_fd) {
     const char* bad_request =
@@ -17,7 +38,7 @@ void SendBadRequest(int client_fd) {
         "Content-Length: 0\r\n"
         "Connection: close\r\n"
         "\r\n";
-    send(client_fd, bad_request, std::strlen(bad_request), 0);
+    SendAll(client_fd, bad_request, std::strlen(bad_request));
 }
 
 // Real-world servers cap this (nginx defaults to 8K) so a client that never
@@ -57,9 +78,12 @@ std::optional<std::string> ReadRequestHeaders(int client_fd) {
 
 }  // namespace
 
-int main() {
-    constexpr int kPort = 8080;
+int main(int argc, char** argv) {
+    const int port = argc > 1 ? std::atoi(argv[1]) : 8080;
+    const std::string public_root = argc > 2 ? argv[2] : "public";
     constexpr int kBacklog = 16;
+
+    http::StaticFileRouter router(public_root);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -79,7 +103,7 @@ int main() {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(kPort);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
 
     if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         perror("bind");
@@ -93,7 +117,7 @@ int main() {
         return 1;
     }
 
-    std::printf("Listening on port %d...\n", kPort);
+    std::printf("Listening on port %d, serving files from \"%s\"...\n", port, public_root.c_str());
 
     for (;;) {
         sockaddr_in client_addr{};
@@ -122,20 +146,17 @@ int main() {
             continue;
         }
 
-        std::printf("%s %s%s%s HTTP/%d.%d\n", request->method_raw.c_str(), request->path.c_str(),
-                     request->query.empty() ? "" : "?", request->query.c_str(),
-                     request->version_major, request->version_minor);
-        for (const auto& [name, value] : request->headers) {
-            std::printf("  %s: %s\n", name.c_str(), value.c_str());
-        }
+        http::Response response = router.Handle(*request);
 
-        const char* response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Length: 13\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Hello, world!";
-        send(client_fd, response, std::strlen(response), 0);
+        std::printf("%s %s%s%s HTTP/%d.%d -> %d %s\n", request->method_raw.c_str(),
+                     request->path.c_str(), request->query.empty() ? "" : "?",
+                     request->query.c_str(), request->version_major, request->version_minor,
+                     response.status_code, response.reason_phrase.c_str());
+
+        std::string header_bytes = response.SerializeHeader();
+        if (SendAll(client_fd, header_bytes.data(), header_bytes.size()) && !response.body.empty()) {
+            SendAll(client_fd, response.body.data(), response.body.size());
+        }
 
         close(client_fd);
     }
