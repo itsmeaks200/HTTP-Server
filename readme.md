@@ -12,7 +12,7 @@ Built incrementally as a learning project — see the roadmap below.
 - [x] Milestone 4 — Static file serving + response building + status codes
 - [x] Milestone 5 — MIME types, Content-Length, Content-Type
 - [x] Milestone 6 — Security hardening (path traversal, malformed requests, limits)
-- [ ] Milestone 7 — Keep-Alive / persistent connections
+- [x] Milestone 7 — Keep-Alive / persistent connections
 - [ ] Milestone 8 — Concurrency problem: thread-per-connection and its limits
 - [ ] Milestone 9 — Thread pool (task queue, mutex, condition_variable)
 - [ ] Milestone 10 — Structured logging (timestamp, client IP, status, latency)

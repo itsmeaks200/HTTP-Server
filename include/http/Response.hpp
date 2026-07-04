@@ -13,6 +13,9 @@ struct Response {
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;             // actual bytes to send (empty for HEAD)
     std::size_t content_length = 0;  // written into the Content-Length header regardless
+    // Set by the connection-handling loop (not the router) once it has
+    // negotiated persistence for this request — see main.cpp's WantsKeepAlive.
+    bool keep_alive = false;
 
     void SetHeader(std::string name, std::string value) {
         headers.emplace_back(std::move(name), std::move(value));
