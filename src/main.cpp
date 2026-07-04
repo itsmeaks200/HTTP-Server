@@ -83,7 +83,13 @@ int main(int argc, char** argv) {
     const std::string public_root = argc > 2 ? argv[2] : "public";
     constexpr int kBacklog = 16;
 
-    http::StaticFileRouter router(public_root);
+    auto router = http::StaticFileRouter::Create(public_root);
+    if (!router) {
+        std::fprintf(stderr,
+                      "Fatal: public root \"%s\" does not exist or cannot be resolved\n",
+                      public_root.c_str());
+        return 1;
+    }
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -146,7 +152,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        http::Response response = router.Handle(*request);
+        http::Response response = router->Handle(*request);
 
         std::printf("%s %s%s%s HTTP/%d.%d -> %d %s\n", request->method_raw.c_str(),
                      request->path.c_str(), request->query.empty() ? "" : "?",

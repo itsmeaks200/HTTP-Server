@@ -3,7 +3,9 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <utility>
 
@@ -22,10 +24,44 @@ Response MakeError(int status_code, std::string reason_phrase) {
     return r;
 }
 
+// Resolves `path` to an absolute, symlink-free canonical form. Returns
+// std::nullopt if the path doesn't exist or can't be resolved (broken
+// symlink, missing intermediate directory, permission denied, etc.). Uses
+// realpath()'s malloc-a-buffer-for-me form (path == nullptr) instead of a
+// fixed PATH_MAX stack buffer, so there's no arbitrary length cap involved.
+std::optional<std::string> CanonicalPath(const std::string& path) {
+    std::unique_ptr<char, decltype(&std::free)> resolved(realpath(path.c_str(), nullptr),
+                                                           &std::free);
+    if (!resolved) {
+        return std::nullopt;
+    }
+    return std::string(resolved.get());
+}
+
+// True if `candidate` is exactly `root`, or nested underneath it. Both
+// arguments must already be canonical (absolute, symlinks resolved, no ".."
+// segments) — this is then a pure string comparison, so it can't itself be
+// fooled by the tricks it exists to catch.
+bool IsContainedIn(const std::string& candidate, const std::string& root) {
+    if (candidate == root) {
+        return true;
+    }
+    return candidate.size() > root.size() && candidate.compare(0, root.size(), root) == 0 &&
+           candidate[root.size()] == '/';
+}
+
 }  // namespace
 
-StaticFileRouter::StaticFileRouter(std::string root_directory)
-    : root_directory_(std::move(root_directory)) {}
+std::optional<StaticFileRouter> StaticFileRouter::Create(const std::string& root_directory) {
+    auto canonical_root = CanonicalPath(root_directory);
+    if (!canonical_root) {
+        return std::nullopt;
+    }
+    return StaticFileRouter(*canonical_root);
+}
+
+StaticFileRouter::StaticFileRouter(std::string canonical_root)
+    : canonical_root_(std::move(canonical_root)) {}
 
 Response StaticFileRouter::Handle(const Request& request) const {
     if (request.method != Method::kGet && request.method != Method::kHead) {
@@ -34,23 +70,40 @@ Response StaticFileRouter::Handle(const Request& request) const {
         return r;
     }
 
-    // NOTE: naive concatenation — "../" in request.path escapes root_directory_
-    // right now. Fixed in Milestone 6, not here.
+    // Reject embedded NUL bytes before they reach any C API that treats
+    // strings as NUL-terminated — a raw NUL lets an attacker smuggle a
+    // shorter path past validation than the one actually opened (the
+    // classic "poison null byte" trick).
+    if (request.path.find('\0') != std::string::npos) {
+        return MakeError(400, "Bad Request");
+    }
+
     std::string path = request.path == "/" ? "/index.html" : request.path;
-    std::string full_path = root_directory_ + path;
+    std::string candidate = canonical_root_ + path;
+
+    // This single check closes both traversal vectors flagged as open back
+    // in Milestone 4: realpath() collapses "../" segments AND resolves
+    // symlinks, so a symlink inside the root pointing outside it is caught
+    // by the exact same containment check as a literal "../../etc/passwd".
+    auto canonical_candidate = CanonicalPath(candidate);
+    if (!canonical_candidate || !IsContainedIn(*canonical_candidate, canonical_root_)) {
+        // Identical to "file doesn't exist" on purpose — telling an
+        // attacker "that path escapes the root" versus "that path is
+        // missing" would itself leak information about the filesystem
+        // outside the served root.
+        return MakeError(404, "Not Found");
+    }
+    std::string full_path = *canonical_candidate;
 
     struct stat st{};
     if (stat(full_path.c_str(), &st) != 0) {
-        if (errno == EACCES) {
-            return MakeError(403, "Forbidden");
-        }
-        return MakeError(404, "Not Found");
+        // realpath() just confirmed this path resolves, so reaching here
+        // almost always means the file vanished in the tiny window between
+        // resolution and this stat() (TOCTOU) — an operational hiccup, not
+        // something the client did wrong.
+        return MakeError(500, "Internal Server Error");
     }
 
-    // Directories, sockets, device files, etc. are not servable as static
-    // content. stat() follows symlinks, so a symlink to a regular file is
-    // accepted here — including one that points outside root_directory_,
-    // which is another traversal vector closed in Milestone 6.
     if (!S_ISREG(st.st_mode)) {
         return MakeError(403, "Forbidden");
     }

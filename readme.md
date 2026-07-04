@@ -11,7 +11,7 @@ Built incrementally as a learning project — see the roadmap below.
 - [x] Milestone 3 — Robust HTTP request parsing (method, path, version, headers)
 - [x] Milestone 4 — Static file serving + response building + status codes
 - [x] Milestone 5 — MIME types, Content-Length, Content-Type
-- [ ] Milestone 6 — Security hardening (path traversal, malformed requests, limits)
+- [x] Milestone 6 — Security hardening (path traversal, malformed requests, limits)
 - [ ] Milestone 7 — Keep-Alive / persistent connections
 - [ ] Milestone 8 — Concurrency problem: thread-per-connection and its limits
 - [ ] Milestone 9 — Thread pool (task queue, mutex, condition_variable)
