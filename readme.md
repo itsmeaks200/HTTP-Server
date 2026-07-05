@@ -13,11 +13,11 @@ Built incrementally as a learning project — see the roadmap below.
 - [x] Milestone 5 — MIME types, Content-Length, Content-Type
 - [x] Milestone 6 — Security hardening (path traversal, malformed requests, limits)
 - [x] Milestone 7 — Keep-Alive / persistent connections
-- [ ] Milestone 8 — Concurrency problem: thread-per-connection and its limits
-- [ ] Milestone 9 — Thread pool (task queue, mutex, condition_variable)
-- [ ] Milestone 10 — Structured logging (timestamp, client IP, status, latency)
-- [ ] Milestone 11 — Error handling, robustness, graceful degradation
-- [ ] Milestone 12 — Performance (zero-copy file streaming, benchmarking with ab/wrk)
+- [x] Milestone 8 — Concurrency problem: thread-per-connection and its limits
+- [x] Milestone 9 — Thread pool (task queue, mutex, condition_variable)
+- [x] Milestone 10 — Structured logging (timestamp, client IP, status, latency)
+- [x] Milestone 11 — Error handling, robustness, graceful degradation
+- [x] Milestone 12 — Performance (zero-copy file streaming, benchmarking with ab/wrk)
 
 ## Build
 
@@ -34,4 +34,31 @@ cmake --build build
 
 ```bash
 curl -v http://localhost:8080/
+```
+
+Concurrency test (requires `apache2-utils`):
+
+```bash
+ab -n 5000 -c 50 http://localhost:8080/
+```
+
+## Benchmarks
+
+> Fill in after running `wrk` before/after Milestone 12's `sendfile()` change.
+
+```
+# Before sendfile() (ostringstream read)
+Requests/sec:  TBD
+Latency p50:   TBD ms
+Latency p99:   TBD ms
+
+# After sendfile() (zero-copy)
+Requests/sec:  TBD
+Latency p50:   TBD ms
+Latency p99:   TBD ms
+```
+
+```bash
+# Reproduce with:
+wrk -t 4 -c 100 -d 10s http://localhost:8080/
 ```

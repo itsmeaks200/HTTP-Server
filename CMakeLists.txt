@@ -9,6 +9,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+find_package(Threads REQUIRED)
+
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_executable(http_server
@@ -20,3 +22,4 @@ add_executable(http_server
     src/util/StringUtils.cpp
 )
 target_include_directories(http_server PRIVATE include)
+target_link_libraries(http_server PRIVATE Threads::Threads)

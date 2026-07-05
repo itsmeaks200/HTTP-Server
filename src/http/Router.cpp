@@ -1,12 +1,11 @@
 #include "http/Router.hpp"
 
+#include <fcntl.h>
 #include <sys/stat.h>
 
 #include <cerrno>
 #include <cstdlib>
-#include <fstream>
 #include <memory>
-#include <sstream>
 #include <utility>
 
 #include "http/MimeTypes.hpp"
@@ -115,15 +114,16 @@ Response StaticFileRouter::Handle(const Request& request) const {
     r.content_length = static_cast<std::size_t>(st.st_size);
 
     // HEAD must report the same Content-Length as GET would, but must not
-    // actually read the body — so the file read only happens for GET.
+    // actually read the body — so we only open the file for GET.
     if (request.method == Method::kGet) {
-        std::ifstream file(full_path, std::ios::binary);
-        if (!file) {
+        int fd = open(full_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
             return MakeError(403, "Forbidden");
         }
-        std::ostringstream contents;
-        contents << file.rdbuf();
-        r.body = contents.str();
+        // Transfer fd ownership to the Response — SendResponse() will call
+        // sendfile() and then close() this fd once the transfer is done.
+        r.body_fd   = fd;
+        r.body_size = r.content_length;
     }
     return r;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,8 +12,16 @@ struct Response {
     int status_code = 200;
     std::string reason_phrase = "OK";
     std::vector<std::pair<std::string, std::string>> headers;
-    std::string body;             // actual bytes to send (empty for HEAD)
+    std::string body;             // actual bytes to send (empty for HEAD or sendfile path)
     std::size_t content_length = 0;  // written into the Content-Length header regardless
+
+    // Milestone 12 zero-copy path: when body_fd is set, SendResponse() calls
+    // sendfile() for exactly body_size bytes instead of sending `body`.  The
+    // router opens the fd; SendResponse() closes it after transfer.  HEAD
+    // responses and error responses always leave body_fd empty and use `body`.
+    std::optional<int> body_fd;   // open file descriptor to stream (or empty)
+    std::size_t        body_size = 0;  // byte count to send via sendfile()
+
     // Set by the connection-handling loop (not the router) once it has
     // negotiated persistence for this request — see main.cpp's WantsKeepAlive.
     bool keep_alive = false;

@@ -6,17 +6,31 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <optional>
 #include <string>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <thread>
 #include <unistd.h>
 
 #include "http/RequestParser.hpp"
 #include "http/Router.hpp"
+#include "http/ThreadPool.hpp"
+#include "util/Logger.hpp"
 #include "util/StringUtils.hpp"
 
+// ── Shutdown flag ─────────────────────────────────────────────────────────────
+// Set to true by the SIGINT/SIGTERM handler; the accept loop checks it each
+// iteration and breaks cleanly, allowing in-flight requests to finish before
+// the process exits.
+static std::atomic<bool> g_shutdown{false};
+
 namespace {
+
+// ── Low-level send helpers ───────────────────────────────────────────────────
 
 // Loops send() to handle partial writes, which POSIX explicitly permits
 // (send() may transfer fewer bytes than requested even on success).
@@ -36,10 +50,43 @@ bool SendAll(int fd, const char* data, size_t len) {
     return true;
 }
 
+// Streams a file to the socket via sendfile() (zero-copy, kernel-space only).
+// Loops to handle partial transfers — sendfile() may move fewer bytes than
+// requested when the socket send buffer is full.
+bool SendFileAll(int socket_fd, int file_fd, size_t len) {
+    off_t offset = 0;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = sendfile(socket_fd, file_fd, &offset, remaining);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("sendfile");
+            return false;
+        }
+        if (n == 0) {
+            break;  // file shrunk between stat() and sendfile() — stop gracefully
+        }
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
 bool SendResponse(int client_fd, const http::Response& response) {
     std::string header_bytes = response.SerializeHeader();
     if (!SendAll(client_fd, header_bytes.data(), header_bytes.size())) {
+        if (response.body_fd) {
+            close(*response.body_fd);
+        }
         return false;
+    }
+    if (response.body_fd) {
+        // Zero-copy path (Milestone 12): stream the file directly from kernel
+        // space, then close the fd whose ownership was transferred from the router.
+        bool ok = SendFileAll(client_fd, *response.body_fd, response.body_size);
+        close(*response.body_fd);
+        return ok;
     }
     if (!response.body.empty() && !SendAll(client_fd, response.body.data(), response.body.size())) {
         return false;
@@ -74,6 +121,20 @@ void SendNotImplemented(int client_fd) {
     SendAll(client_fd, response, std::strlen(response));
 }
 
+void SendServiceUnavailable(int client_fd) {
+    // The thread pool queue is full — there are already kMaxQueueDepth
+    // pending connections.  Returning 503 immediately is better than making
+    // the client wait for an unknown duration with no feedback.
+    const char* response =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    SendAll(client_fd, response, std::strlen(response));
+}
+
+// ── Request-reading constants ─────────────────────────────────────────────────
+
 // Real-world servers cap this (nginx defaults to 8K) so a client that never
 // sends a terminating blank line can't grow this buffer without bound.
 constexpr size_t kMaxRequestHeaderBytes = 8192;
@@ -85,10 +146,18 @@ constexpr size_t kMaxRequestBodyBytes = 1 << 20;  // 1 MiB
 
 // How long a connection may sit idle — whether waiting on the first byte of
 // a request or, once kept alive, waiting on the next one — before the
-// server gives up on it. Without this, a client that opens a connection and
-// never sends anything (or never sends another request) would tie up this
-// thread forever.
+// server gives up on it.  Under a bounded thread pool (Milestone 9) a slow
+// or idle client can occupy a worker for the full timeout duration, directly
+// capping concurrent capacity.  Accepted tradeoff: keeps the I/O model
+// simple without a separate epoll/event loop.
 constexpr int kIdleTimeoutSeconds = 10;
+
+// Maximum number of requests served on a single persistent connection.
+// Without this, a keep-alive client could occupy a worker thread indefinitely
+// even if each individual request completes promptly.
+constexpr int kMaxRequestsPerConnection = 100;
+
+// ── Header / body reading ─────────────────────────────────────────────────────
 
 enum class HeaderReadStatus {
     kOk,       // a full header block (through the blank line) is in out_headers
@@ -98,10 +167,17 @@ enum class HeaderReadStatus {
 
 // Reads from `buf` (bytes already buffered from a previous call) and then
 // the socket, until `buf` contains a full "\r\n\r\n"-terminated header
-// block. Whatever comes after that terminator (a pipelined request, or body
+// block.  Whatever comes after that terminator (a pipelined request, or body
 // bytes belonging to this request) is left in `buf` for the next call,
 // since TCP gives no guarantee that a single recv() lines up with HTTP
 // message boundaries.
+//
+// Known gap (Milestone 11): the SO_RCVTIMEO timeout is per-recv() call, not
+// a bound on total time-to-complete-headers.  A slow-loris client that sends
+// one byte every (kIdleTimeoutSeconds - 1) seconds will never trigger the
+// timeout here.  Closing this gap properly requires tracking wall-clock time
+// across recv() calls or switching to non-blocking I/O + epoll.  Accepted
+// as a known tradeoff for this milestone.
 HeaderReadStatus ReadHeaderBlock(int client_fd, std::string& buf, std::string& out_headers) {
     bool received_any_for_this_request = !buf.empty();
 
@@ -190,7 +266,7 @@ std::optional<size_t> ParseContentLength(const std::string& value) {
 }
 
 // Case-insensitive check for whether a header value contains `token` as a
-// substring. Real Connection/Transfer-Encoding values are short,
+// substring.  Real Connection/Transfer-Encoding values are short,
 // comma-separated lists ("keep-alive", "close", "keep-alive, Upgrade",
 // "chunked") where a substring match is equivalent to a proper token match.
 bool HeaderValueContains(const std::string& value, const std::string& token) {
@@ -211,10 +287,16 @@ bool WantsKeepAlive(const http::Request& request) {
     return connection && HeaderValueContains(*connection, "keep-alive");
 }
 
+// ── Connection handler ────────────────────────────────────────────────────────
+
 // Serves requests off one accepted connection until the peer disconnects,
-// the negotiated Connection semantics call for closing, or the connection
-// sits idle past kIdleTimeoutSeconds.
-void HandleConnection(int client_fd, const http::StaticFileRouter& router) {
+// the negotiated Connection semantics call for closing, the connection sits
+// idle past kIdleTimeoutSeconds, or kMaxRequestsPerConnection is reached.
+//
+// client_ip is captured at accept() time (inet_ntop) and threaded through
+// here so the structured log line can record it alongside request details.
+void HandleConnection(int client_fd, std::string client_ip,
+                      const http::StaticFileRouter& router, util::Logger& logger) {
     timeval timeout{};
     timeout.tv_sec = kIdleTimeoutSeconds;
     if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
@@ -222,8 +304,13 @@ void HandleConnection(int client_fd, const http::StaticFileRouter& router) {
     }
 
     std::string buf;  // bytes read from the socket but not yet consumed
+    int request_count = 0;
 
     for (;;) {
+        if (request_count >= kMaxRequestsPerConnection) {
+            break;  // cap total connection lifetime regardless of keep-alive
+        }
+
         std::string header_block;
         HeaderReadStatus read_status = ReadHeaderBlock(client_fd, buf, header_block);
         if (read_status == HeaderReadStatus::kClosed) {
@@ -233,6 +320,11 @@ void HandleConnection(int client_fd, const http::StaticFileRouter& router) {
             SendBadRequest(client_fd);
             break;
         }
+
+        // Start latency measurement here — after the full header block is
+        // received — so we're timing routing + response serialisation + send,
+        // not the client's network RTT for delivering the request headers.
+        auto req_start = std::chrono::steady_clock::now();
 
         auto request = http::ParseRequest(header_block);
         if (!request) {
@@ -270,16 +362,25 @@ void HandleConnection(int client_fd, const http::StaticFileRouter& router) {
         http::Response response = router.Handle(*request);
         response.keep_alive = keep_alive;
 
-        std::printf("%s %s%s%s HTTP/%d.%d -> %d %s%s\n", request->method_raw.c_str(),
-                     request->path.c_str(), request->query.empty() ? "" : "?",
-                     request->query.c_str(), request->version_major, request->version_minor,
-                     response.status_code, response.reason_phrase.c_str(),
-                     keep_alive ? "" : " (closing)");
+        bool sent = SendResponse(client_fd, response);
 
-        if (!SendResponse(client_fd, response)) {
-            break;
-        }
-        if (!keep_alive) {
+        // Latency: end-of-headers-read → end-of-response-sent.
+        auto req_end = std::chrono::steady_clock::now();
+        long latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              req_end - req_start).count();
+
+        util::LogEntry entry;
+        entry.client_ip  = client_ip;
+        entry.method     = request->method_raw;
+        entry.path       = request->path;
+        entry.query      = request->query;
+        entry.status     = response.status_code;
+        entry.latency_ms = latency_ms;
+        logger.Log(entry);
+
+        ++request_count;
+
+        if (!sent || !keep_alive) {
             break;
         }
     }
@@ -289,10 +390,37 @@ void HandleConnection(int client_fd, const http::StaticFileRouter& router) {
 
 }  // namespace
 
+// ── Signal handling ───────────────────────────────────────────────────────────
+
+#include <csignal>
+
+static void HandleSignal(int /*signum*/) {
+    // async-signal-safe: writing to an atomic<bool> is safe from a signal handler.
+    g_shutdown.store(true);
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
 int main(int argc, char** argv) {
     const int port = argc > 1 ? std::atoi(argv[1]) : 8080;
     const std::string public_root = argc > 2 ? argv[2] : "public";
+
+    // Thread pool size: configurable via argv[3]; defaults to 4.
+    // 4 workers is a sensible starting point matching a typical core count;
+    // tune upward if your workload is I/O-bound and the OS supports more threads.
+    constexpr std::size_t kDefaultWorkerCount = 4;
+    const std::size_t worker_count =
+        argc > 3 ? static_cast<std::size_t>(std::atoi(argv[3])) : kDefaultWorkerCount;
+
     constexpr int kBacklog = 16;
+
+    // ── Install signal handlers (Milestone 11) ────────────────────────────────
+    struct sigaction sa{};
+    sa.sa_handler = HandleSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     auto router = http::StaticFileRouter::Create(public_root);
     if (!router) {
@@ -301,6 +429,9 @@ int main(int argc, char** argv) {
                       public_root.c_str());
         return 1;
     }
+
+    util::Logger logger;
+    http::ThreadPool pool(worker_count);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -334,24 +465,56 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("Listening on port %d, serving files from \"%s\"...\n", port, public_root.c_str());
+    std::printf("Listening on port %d (workers: %zu), serving \"%s\"...\n",
+                port, worker_count, public_root.c_str());
 
+    // ── Accept loop ───────────────────────────────────────────────────────────
     for (;;) {
+        if (g_shutdown.load()) {
+            break;  // SIGINT/SIGTERM received — stop accepting new connections
+        }
+
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
         if (client_fd < 0) {
+            if (errno == EINTR) {
+                // Interrupted by signal — loop back to check g_shutdown.
+                continue;
+            }
+            if (errno == EMFILE || errno == ENFILE) {
+                // File descriptor exhaustion: back off briefly so we don't
+                // spin-burn CPU while waiting for fds to be released.
+                perror("accept (fd exhaustion, backing off)");
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            // Other errors (e.g. ECONNABORTED) are transient — log and retry.
             perror("accept");
             continue;
         }
 
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-        std::printf("Connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
+        std::string client_ip_str(client_ip);
 
-        HandleConnection(client_fd, *router);
+        // Enqueue the connection for a worker thread.  If the queue is full,
+        // respond with 503 immediately and close — this provides backpressure
+        // instead of growing memory without bound during traffic spikes.
+        bool enqueued = pool.Enqueue([client_fd, client_ip_str, &router, &logger]() mutable {
+            HandleConnection(client_fd, std::move(client_ip_str), *router, logger);
+        });
+
+        if (!enqueued) {
+            SendServiceUnavailable(client_fd);
+            close(client_fd);
+        }
     }
 
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
+    std::printf("\nShutting down — waiting for in-flight requests to finish...\n");
+    pool.Shutdown();   // signals workers to stop, then joins all threads
     close(listen_fd);
+    std::printf("Done.\n");
     return 0;
 }
